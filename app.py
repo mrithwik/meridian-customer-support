@@ -43,15 +43,16 @@ def convert_mcp_tools_to_openai_format(mcp_tools: list) -> list:
     return openai_tools
 
 
-def run_agent(user_message: str, history: list, openai_tools: list):
+def run_agent(user_message: str, history: list, openai_tools: list) -> str:
     """
-    Streaming agent loop:
+    The agent loop:
     1. Build the message list from history + new user message
-    2. Stream from GPT-4o-mini with tools enabled
-    3. If GPT streams text, yield each chunk so Gradio updates the UI in real time
-    4. If GPT calls a tool, accumulate the full tool call (it arrives in chunks),
-       execute it, then stream the follow-up response
-    5. Repeat until GPT stops calling tools
+    2. Call GPT-4o-mini with the available tools
+    3. If GPT calls a tool, execute it and feed the result back
+    4. Repeat until GPT gives a plain text response
+
+    Note: streaming was attempted but this version of Gradio's ChatInterface
+    does not support generator functions — reverted to standard response.
     """
     # Build message history in OpenAI format.
     # Fix #3 & #4 — handle both Gradio history formats defensively:
@@ -68,64 +69,32 @@ def run_agent(user_message: str, history: list, openai_tools: list):
 
     # Agent loop — keep going until GPT stops calling tools
     while True:
-        stream = client.chat.completions.create(
+        response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=messages,
             tools=openai_tools,
-            stream=True,
         )
 
-        # Accumulate the full response as chunks arrive
-        full_text = ""
-        tool_calls = []
+        message = response.choices[0].message
 
-        for chunk in stream:
-            delta = chunk.choices[0].delta
+        # If no tool calls, GPT is done — return the final text response
+        if not message.tool_calls:
+            return message.content
 
-            # Stream text tokens directly to the Gradio UI
-            if delta.content:
-                full_text += delta.content
-                yield full_text
+        # GPT wants to call one or more tools — execute each one
+        messages.append(message)
 
-            # Tool call data arrives in chunks — accumulate into a list
-            if delta.tool_calls:
-                for tc_chunk in delta.tool_calls:
-                    # Each tool call has an index — grow the list as needed
-                    while len(tool_calls) <= tc_chunk.index:
-                        tool_calls.append({"id": "", "name": "", "arguments": ""})
-                    if tc_chunk.id:
-                        tool_calls[tc_chunk.index]["id"] = tc_chunk.id
-                    if tc_chunk.function.name:
-                        tool_calls[tc_chunk.index]["name"] += tc_chunk.function.name
-                    if tc_chunk.function.arguments:
-                        tool_calls[tc_chunk.index]["arguments"] += tc_chunk.function.arguments
+        for tool_call in message.tool_calls:
+            tool_name = tool_call.function.name
+            tool_args = json.loads(tool_call.function.arguments)
 
-        # No tool calls — GPT gave a plain text response, we're done
-        if not tool_calls:
-            return
+            print(f"Calling tool: {tool_name} with args: {tool_args}")
+            tool_result = mcp_client.call_tool(tool_name, tool_args)
 
-        # GPT called tools — build the assistant message and execute each tool
-        messages.append({
-            "role": "assistant",
-            "content": full_text or None,
-            "tool_calls": [
-                {
-                    "id": tc["id"],
-                    "type": "function",
-                    "function": {"name": tc["name"], "arguments": tc["arguments"]},
-                }
-                for tc in tool_calls
-            ],
-        })
-
-        for tc in tool_calls:
-            print(f"Calling tool: {tc['name']} with args: {tc['arguments']}")
-            tool_result = mcp_client.call_tool(tc["name"], json.loads(tc["arguments"]))
-
-            # Feed each tool result back into the conversation
+            # Feed the tool result back into the conversation
             messages.append({
                 "role": "tool",
-                "tool_call_id": tc["id"],
+                "tool_call_id": tool_call.id,
                 "content": tool_result,
             })
 
@@ -160,8 +129,12 @@ def main():
             "Can you help me place an order?",
         ],
     )
-    # server_name="0.0.0.0" makes the app accessible outside the container (required for HF Spaces)
-    demo.launch(server_name="0.0.0.0", server_port=7860)
+    # server_name="0.0.0.0" makes the app accessible outside the container (required for HF Spaces).
+    # server_port is read from the environment so HF Spaces can set it to 7860,
+    # while locally Gradio picks any available port automatically.
+    import os
+    port = int(os.getenv("GRADIO_SERVER_PORT", 0)) or None
+    demo.launch(server_name="0.0.0.0", server_port=port)
 
 
 if __name__ == "__main__":
