@@ -43,13 +43,15 @@ def convert_mcp_tools_to_openai_format(mcp_tools: list) -> list:
     return openai_tools
 
 
-def run_agent(user_message: str, history: list, openai_tools: list) -> str:
+def run_agent(user_message: str, history: list, openai_tools: list):
     """
-    The agent loop:
+    Streaming agent loop:
     1. Build the message list from history + new user message
-    2. Call GPT-4o-mini with the available tools
-    3. If GPT calls a tool, execute it and feed the result back
-    4. Repeat until GPT gives a plain text response
+    2. Stream from GPT-4o-mini with tools enabled
+    3. If GPT streams text, yield each chunk so Gradio updates the UI in real time
+    4. If GPT calls a tool, accumulate the full tool call (it arrives in chunks),
+       execute it, then stream the follow-up response
+    5. Repeat until GPT stops calling tools
     """
     # Build message history in OpenAI format.
     # Fix #3 & #4 — handle both Gradio history formats defensively:
@@ -60,39 +62,70 @@ def run_agent(user_message: str, history: list, openai_tools: list) -> str:
         if isinstance(msg, dict):
             messages.append({"role": msg["role"], "content": msg["content"]})
         else:
-            user_msg, assistant_msg = msg[0], msg[1]
-            messages.append({"role": "user", "content": user_msg})
-            messages.append({"role": "assistant", "content": assistant_msg})
+            messages.append({"role": "user", "content": msg[0]})
+            messages.append({"role": "assistant", "content": msg[1]})
     messages.append({"role": "user", "content": user_message})
 
     # Agent loop — keep going until GPT stops calling tools
     while True:
-        response = client.chat.completions.create(
+        stream = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=messages,
             tools=openai_tools,
+            stream=True,
         )
 
-        message = response.choices[0].message
+        # Accumulate the full response as chunks arrive
+        full_text = ""
+        tool_calls = []
 
-        # If no tool calls, GPT is done — return the final text response
-        if not message.tool_calls:
-            return message.content
+        for chunk in stream:
+            delta = chunk.choices[0].delta
 
-        # GPT wants to call one or more tools — execute each one
-        messages.append(message)  # add GPT's decision to the message history
+            # Stream text tokens directly to the Gradio UI
+            if delta.content:
+                full_text += delta.content
+                yield full_text
 
-        for tool_call in message.tool_calls:
-            tool_name = tool_call.function.name
-            tool_args = json.loads(tool_call.function.arguments)
+            # Tool call data arrives in chunks — accumulate into a list
+            if delta.tool_calls:
+                for tc_chunk in delta.tool_calls:
+                    # Each tool call has an index — grow the list as needed
+                    while len(tool_calls) <= tc_chunk.index:
+                        tool_calls.append({"id": "", "name": "", "arguments": ""})
+                    if tc_chunk.id:
+                        tool_calls[tc_chunk.index]["id"] = tc_chunk.id
+                    if tc_chunk.function.name:
+                        tool_calls[tc_chunk.index]["name"] += tc_chunk.function.name
+                    if tc_chunk.function.arguments:
+                        tool_calls[tc_chunk.index]["arguments"] += tc_chunk.function.arguments
 
-            print(f"Calling tool: {tool_name} with args: {tool_args}")
-            tool_result = mcp_client.call_tool(tool_name, tool_args)
+        # No tool calls — GPT gave a plain text response, we're done
+        if not tool_calls:
+            return
 
-            # Feed the tool result back into the conversation
+        # GPT called tools — build the assistant message and execute each tool
+        messages.append({
+            "role": "assistant",
+            "content": full_text or None,
+            "tool_calls": [
+                {
+                    "id": tc["id"],
+                    "type": "function",
+                    "function": {"name": tc["name"], "arguments": tc["arguments"]},
+                }
+                for tc in tool_calls
+            ],
+        })
+
+        for tc in tool_calls:
+            print(f"Calling tool: {tc['name']} with args: {tc['arguments']}")
+            tool_result = mcp_client.call_tool(tc["name"], json.loads(tc["arguments"]))
+
+            # Feed each tool result back into the conversation
             messages.append({
                 "role": "tool",
-                "tool_call_id": tool_call.id,
+                "tool_call_id": tc["id"],
                 "content": tool_result,
             })
 
