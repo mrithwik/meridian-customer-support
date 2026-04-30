@@ -116,7 +116,8 @@ def main():
             "Can you help me place an order?",
         ],
     )
-    demo.launch()
+    # server_name="0.0.0.0" makes the app accessible outside the container (required for HF Spaces)
+    demo.launch(server_name="0.0.0.0", server_port=7860)
 
 
 if __name__ == "__main__":
